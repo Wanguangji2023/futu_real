@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 FutuOpenD A股/港股/美股自动交易
-版本: v1.0
+版本: v1.2
 复刻原OKX逻辑：
 1. 价格跌破任意买点（回撤2下/回调2下/过渡2下/极限2下）激活买入信号，记录最低点
 2. 价格继续下跌更新最低点；价格自最低点反弹1%且仍低于买点执行买入
@@ -31,7 +31,7 @@ load_dotenv()
 
 # ==================== 配置常量 ====================
 PROGRAM_NAME = "futu_autoTrade"
-VERSION = "v1.0"
+VERSION = "v1.2"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, f"{PROGRAM_NAME}_config.xlsx")
 BLACKLIST_FILE = os.path.join(BASE_DIR, f"{PROGRAM_NAME}_blacklist.csv")
@@ -231,12 +231,13 @@ PROFIT_STOP_MAP = [
     (0.212, 0.0003),
     (0.213, 0.0002),
     (0.214, 0.0001),
-    (0.215, 9.02056E-17),
+    (0.215, 0.0),
     (0.216, 0),
 ]
 
 def get_stop_loss(profit_pct: float) -> float:
-    for p, s in PROFIT_STOP_MAP:
+    # 表按利润升序排列，须从高利润端倒序匹配，否则永远命中第一条(0.065,0.015)
+    for p, s in reversed(PROFIT_STOP_MAP):
         if profit_pct >= p:
             return s
     return 0.015
@@ -513,14 +514,9 @@ class FutuClient:
         ret, data = self.trade_ctx.get_accinfo()
         if ret != ft.RET_OK:
             raise FutuTradeError(f"获取账户信息失败 {data}")
-        # 根据市场取对应可用资金
-        if self.market == "HK":
-            return float(data.loc[0, "avail_balance"])
-        elif self.market == "US":
-            return float(data.loc[0, "avail_balance"])
-        elif self.market == "CN":
-            return float(data.loc[0, "avail_balance"])
-        return 0.0
+        # 根据市场取对应可用资金；兼容不同 futu 版本的列名
+        col = "avail_balance" if "avail_balance" in data.columns else "avail_withdraw_cash"
+        return float(data.loc[0, col])
 
     def get_positions(self):
         ret, data = self.trade_ctx.get_position_list()
@@ -538,7 +534,7 @@ class FutuClient:
                 }
         return pos_dict
 
-    def market_buy_amount(self, code: str, amount: float):
+    def market_buy_amount(self, code: str, amount: float, ref_price: float = 0.0):
         """
         按金额市价买入；A股仅模拟打印，不下单
         返回成交结果 dict；error字段表示失败
@@ -548,14 +544,35 @@ class FutuClient:
         if self.trade_mode == "demo":
             self.logger.info(f"[模拟买入] {code} 拟投入金额 {amount:.2f}")
             return {"price": 0, "qty": 0, "cost": amount, "ord_id": "SIM", "error": None}
-        # 实盘：富途API按数量下单，这里做简化封装
+        # 实盘：富途API按数量市价下单，需先用参考价折算数量（无按金额市价下单接口）
+        price = ref_price if ref_price > 0 else self._get_last_price(code)
+        if price <= 0:
+            return {"error": f"无法获取参考价折算数量: {code}"}
+        qty = int(amount / price)
+        if qty <= 0:
+            return {"error": f"折算数量为0: 金额{amount:.2f} / 价格{price:.6g}"}
         ret, ret_data = self.trade_ctx.place_order(
-            price=0, qty=0, code=code, order_type=ft.OrderType.MARKET,
-            direction=ft.TrdSide.BUY
+            price=0, qty=qty, code=code, order_type=ft.OrderType.MARKET,
+            trd_side=ft.TrdSide.BUY, trd_env=ft.TrdEnv.REAL
         )
         if ret != ft.RET_OK:
             return {"error": f"下单失败:{ret_data}"}
-        return {"price": 0, "qty": 0, "cost": amount, "ord_id": ret_data, "error": None}
+        return {"price": 0, "qty": qty, "cost": amount, "ord_id": self._extract_order_id(ret_data), "error": None}
+
+    def _extract_order_id(self, ret_data) -> str:
+        try:
+            return str(ret_data["order_id"].iloc[0])
+        except Exception:
+            return str(ret_data)
+
+    def _get_last_price(self, code: str) -> float:
+        try:
+            ret, data = self.quote_ctx.get_market_snapshot([code])
+            if ret == ft.RET_OK and data is not None and len(data) > 0:
+                return float(data.iloc[0]["last_price"])
+        except Exception:
+            pass
+        return 0.0
 
     def market_sell_qty(self, code: str, qty: float):
         if self.market == "CN" and self.trade_mode == "live":
@@ -565,11 +582,11 @@ class FutuClient:
             return {"price":0, "qty": qty, "proceeds":0, "ord_id":"SIM", "error": None}
         ret, ret_data = self.trade_ctx.place_order(
             price=0, qty=int(qty), code=code, order_type=ft.OrderType.MARKET,
-            direction=ft.TrdSide.SELL
+            trd_side=ft.TrdSide.SELL, trd_env=ft.TrdEnv.REAL
         )
         if ret != ft.RET_OK:
             return {"error": f"卖出失败:{ret_data}"}
-        return {"price":0, "qty": qty, "proceeds":0, "ord_id": ret_data, "error": None}
+        return {"price":0, "qty": qty, "proceeds":0, "ord_id": self._extract_order_id(ret_data), "error": None}
 
     def subscribe_tick(self, code_list: List[str]):
         ret, err = self.quote_ctx.subscribe(code_list, [ft.SubType.TICKER])
@@ -721,8 +738,8 @@ def load_high_low() -> Dict[str, Dict]:
     res = {}
     for r in rows:
         res[r["inst_id"]] = {
-            "all_time_high": float(r.get("all_time_high", 0)),
-            "all_time_low": float(r.get("all_time_low", 0)),
+            "all_time_high": float(r.get("all_time_high", 0) or 0),
+            "all_time_low": float(r.get("all_time_low", 0) or 0),
             "last_update": r.get("last_update", "")
         }
     return res
@@ -748,15 +765,15 @@ def load_pair_status() -> Dict[str, Dict]:
         res[r["inst_id"]] = {
             "pair_type": r.get("pair_type", ""),
             "is_paired": str(r.get("is_paired", "False")).lower() == "true",
-            "buy_price": float(r.get("buy_price", 0)),
+            "buy_price": float(r.get("buy_price", 0) or 0),
             "buy_time": r.get("buy_time", ""),
             "sell_line": r.get("sell_line", ""),
-            "sell_line_price": float(r.get("sell_line_price", 0)),
+            "sell_line_price": float(r.get("sell_line_price", 0) or 0),
             "is_sold": str(r.get("is_sold", "False")).lower() == "true",
             "sell_time": r.get("sell_time", ""),
             "sell_reason": r.get("sell_reason", ""),
-            "profit": float(r.get("profit", 0)),
-            "profit_pct": float(r.get("profit_pct", 0)),
+            "profit": float(r.get("profit", 0) or 0),
+            "profit_pct": float(r.get("profit_pct", 0) or 0),
         }
     return res
 
@@ -799,8 +816,8 @@ def load_config() -> Tuple[Dict, Dict]:
     if not os.path.exists(CONFIG_FILE):
         raise FileNotFoundError(f"配置文件不存在: {CONFIG_FILE}")
     config = {}
+    # 资金口径：一律以富途API账户可用余额为准，配置中禁止设置资金字段（total_funds 已移除，防止与真实账户不一致）
     system_params = {
-        "total_funds": 1000000.0,
         "buy_ratio": 0.01,
         "cooldown_days": 7,
         "profit_trigger": 0.05,
@@ -821,7 +838,12 @@ def load_config() -> Tuple[Dict, Dict]:
             ref_low = ws.cell(row=row, column=3).value
             enabled = ws.cell(row=row, column=4).value
             if inst_id and enabled and str(enabled).upper() in ("YES", "是", "1"):
-                config[inst_id] = {"ref_high": float(ref_high), "ref_low": float(ref_low)}
+                try:
+                    ref_high = float(ref_high)
+                    ref_low = float(ref_low)
+                except (TypeError, ValueError):
+                    continue
+                config[inst_id] = {"ref_high": ref_high, "ref_low": ref_low}
     if "系统参数" in wb.sheetnames:
         ws = wb["系统参数"]
         for row in range(2, ws.max_row + 1):
@@ -852,7 +874,7 @@ class SymbolState:
         self.ding_webhook = ding_webhook
         self.ding_secret = ding_secret
         self.params = system_params or {}
-        self.total_funds = self.params.get("total_funds", 1000000)
+        # 资金一律取富途API账户余额(get_futu_balance)，不设配置文件资金字段
         self.min_buy_amount = float(os.getenv("MIN_BUY_AMOUNT", "100"))
         self.client = _futu_client
         self.blacklist = load_blacklist()
@@ -935,17 +957,16 @@ class SymbolState:
                     new_status = "静默期_排除"
                 elif self.inst_id in self.observe_list:
                     new_status = "观察列表_排除"
+                elif self.inst_id in self.blacklist:
+                    new_status = "黑名单_排除"
                 else:
                     new_status = "待买入"
                 if row.get("status") != new_status:
                     row["status"] = new_status
-                    changed = True
-                new_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if row.get("last_check_time") != new_ts:
-                    row["last_check_time"] = new_ts
+                    row["last_check_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     changed = True
                 break
-        if not in_queue and not self.has_position and not self._is_in_cooldown() and self.inst_id not in self.observe_list:
+        if not in_queue and not self.has_position and not self._is_in_cooldown() and self.inst_id not in self.observe_list and self.inst_id not in self.blacklist:
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.buy_queue.append({
                 "inst_id": self.inst_id,
@@ -988,19 +1009,20 @@ class SymbolState:
             return False, f"静默期中 (至 {self.cooldown.get(self.inst_id, '')})"
         if self.inst_id in self.observe_list:
             return False, "在待观察列表中"
+        if self.inst_id in self.blacklist:
+            return False, "在黑名单中"
         if time.time() < self._balance_insufficient_until:
-            return False, "余额不足冷却中"
+            return False, f"余额不足冷却中（剩余 {int(self._balance_insufficient_until - time.time())} 秒）"
         if time.time() < self._retry_after:
             return False, f"未知错误重试延迟中（剩余 {int(self._retry_after - time.time())} 秒）"
         balance = get_futu_balance()
+        if balance < self.min_buy_amount:
+            self._balance_insufficient_until = time.time() + 300
+            return False, f"资金不足: 余额 {balance:.2f} < 最小买入 {self.min_buy_amount:.2f}（冷却300秒）"
         raw_amount = balance * self.params.get("buy_ratio", 0.01)
-        buy_amount = max(raw_amount, self.min_buy_amount)
-        if buy_amount > balance:
-            buy_amount = balance
+        buy_amount = min(max(raw_amount, self.min_buy_amount), balance)
         if buy_amount <= 0:
             return False, "计算出的买入金额为0"
-        if balance < buy_amount:
-            return False, f"资金不足: 需要 {buy_amount:.2f}, 余额 {balance:.2f}"
         if self.is_paired and not self.is_sold:
             return False, f"已配对未卖出 ({self.pair_type})"
         return True, ""
@@ -1022,8 +1044,9 @@ class SymbolState:
 
     def _execute_buy(self, price, reason, buy_key, sell_key, pair_name):
         balance = get_futu_balance(force_refresh=True)
-        if balance < 110:
-            self.logger.info(f"{self.inst_id} 账户余额 {balance:.2f} 低于110，跳过买入")
+        if balance < self.min_buy_amount:
+            self._balance_insufficient_until = time.time() + 300
+            self.logger.info(f"{self.inst_id} 账户余额 {balance:.2f} 低于最小买入金额 {self.min_buy_amount:.2f}，跳过买入并冷却300秒")
             return None
         buy_level = getattr(self.levels, buy_key)
         if price >= buy_level:
@@ -1037,7 +1060,7 @@ class SymbolState:
         buy_amount = max(raw_amount, self.min_buy_amount)
         if buy_amount > balance:
             buy_amount = balance
-        fill = self.client.market_buy_amount(self.inst_id, buy_amount)
+        fill = self.client.market_buy_amount(self.inst_id, buy_amount, ref_price=price)
         now = time.time()
         if fill is None:
             self.logger.error(f"{self.inst_id} API买入失败返回None")
@@ -1048,7 +1071,10 @@ class SymbolState:
             return self._handle_unknown_error(reason=error_msg[:100])
         # 成交成功
         price = fill["price"] if fill["price"] != 0 else price
-        qty = fill["qty"] if fill["qty"] != 0 else buy_amount / price
+        qty = fill["qty"] if fill["qty"] != 0 else (buy_amount / price if price > 0 else 0)
+        if qty <= 0:
+            self.logger.error(f"{self.inst_id} 买入成交数量异常 qty={qty}，忽略该笔")
+            return None
         buy_amount = fill["cost"]
         reason = f"{reason} | ordId={fill.get('ord_id','')}"
         self.logger.info(f"{self.inst_id} 买入成交 ordId={fill.get('ord_id')} 均价 {price:.8g} 数量 {qty:.8g} 花费 {buy_amount:.2f}", "buy_execute")
@@ -1227,7 +1253,7 @@ class SymbolState:
         if price > self.peak_price:
             self.peak_price = price
         stop_ratio = get_stop_loss(profit_pct)
-        if stop_ratio == 0 and profit_pct >= 0.20:
+        if profit_pct >= 0.20:
             self.logger.info(f"{self.inst_id} 盈利≥20%立即清仓", "profit_trigger")
             return self._execute_sell(price, f"盈利率 {profit_pct*100:.1f}% ≥20%，清仓")
         new_stop = self.peak_price * (1 - stop_ratio)
@@ -1235,8 +1261,7 @@ class SymbolState:
             self.stop_price = new_stop
         if profit_pct >= 0.05 and not self.profit_triggered:
             self.profit_triggered = True
-            self.check_level = "
-self.stop_price:.8g}", "profit_trigger")
+            self.logger.info(f"{self.inst_id} 盈利率 {profit_pct*100:.2f}% ≥5%，启动动态止盈，当前止损价 {self.stop_price:.8g}", "profit_trigger")
         if self.profit_triggered and price <= self.stop_price:
             self.logger.info(f"{self.inst_id} 触发止盈清仓: 当前价 {price:.8g} ≤ 止盈价 {self.stop_price:.8g}", "stop_loss_trigger")
             return self._execute_sell(price, f"止盈清仓 (峰值 {self.peak_price:.8g}, 止损 {stop_ratio*100:.1f}%)")
@@ -1248,6 +1273,7 @@ self.stop_price:.8g}", "profit_trigger")
             return alerts
         self._last_processed_price = price
         self._last_processed_ts = ts
+        self._sync_buy_queue()
 
         # 更新高低点
         if price > self.high:
@@ -1282,7 +1308,7 @@ self.stop_price:.8g}", "profit_trigger")
                         return alerts
 
         # 无持仓：反弹买入信号逻辑
-        if not self.has_position and not self._is_in_cooldown() and self.inst_id not in self.observe_list:
+        if not self.has_position and not self._is_in_cooldown() and self.inst_id not in self.observe_list and self.inst_id not in self.blacklist:
             buy_key, buy_level = self._get_buy_level(price)
             if buy_key is not None:
                 if not self.buy_signal_activated:
@@ -1459,7 +1485,17 @@ def tick_callback(quote_ctx, ret_code, content):
     for item in content:
         inst_id = item["code"]
         price = float(item["price"])
-        ts = float(item["time"])
+        raw_time = item.get("time", "")
+        if raw_time:
+            try:
+                ts = datetime.strptime(raw_time, "%Y-%m-%d %H:%M:%S.%f").timestamp()
+            except ValueError:
+                try:
+                    ts = datetime.strptime(raw_time, "%Y-%m-%d %H:%M:%S").timestamp()
+                except Exception:
+                    ts = time.time()
+        else:
+            ts = time.time()
         if market_engine:
             market_engine.on_tick(inst_id, price, ts)
 
