@@ -704,7 +704,7 @@ class FutuClient:
         if ret != ft.RET_OK:
             raise Exception(f"accinfo_query 接口错误 ret={ret}, msg={data}")
         if data.empty:
-            raise Exception("accinfo_query 返回空DataFrame")
+            raise Exception("accinfo_query 返回空DataFrame")    
 
         logging.info(f"账户资金返回列:{list(data.columns)}")
         # 字段说明：

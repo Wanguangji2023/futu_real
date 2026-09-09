@@ -1,0 +1,5 @@
+import futu as ft
+ctx = ft.OpenQuoteContext(host="127.0.0.1", port=11111)
+ret, err = ctx.subscribe(["HK.00700"], [ft.SubType.TICKER])
+print(f"ret={ret}, err={err}")
+ctx.close()
